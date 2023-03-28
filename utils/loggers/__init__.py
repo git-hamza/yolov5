@@ -61,7 +61,7 @@ class Loggers():
         self.weights = weights
         self.opt = opt
         self.hyp = hyp
-        self.plots = not opt.noplots  # plot results
+        self.plots = hyp and not opt.noplots  # plot results
         self.logger = logger  # for printing results to console
         self.include = include
         self.keys = [
@@ -108,7 +108,10 @@ class Loggers():
             wandb_artifact_resume = isinstance(self.opt.resume, str) and self.opt.resume.startswith('wandb-artifact://')
             run_id = torch.load(self.weights).get('wandb_id') if self.opt.resume and not wandb_artifact_resume else None
             self.opt.hyp = self.hyp  # add hyperparameters
-            self.wandb = WandbLogger(self.opt, run_id)
+            if self.hyp:
+                self.wandb = WandbLogger(self.opt, run_id)
+            else:
+                self.wandb = WandbLogger(self.opt, run_id, job_type="Testing")
             # temp warn. because nested artifacts not supported after 0.12.10
             # if pkg.parse_version(wandb.__version__) >= pkg.parse_version('0.12.11'):
             #    s = "YOLOv5 temporarily requires wandb version 0.12.10 or below. Some features may not work as expected."
@@ -217,12 +220,19 @@ class Loggers():
         if self.comet_logger:
             self.comet_logger.on_val_batch_end(batch_i, im, targets, paths, shapes, out)
 
-    def on_val_end(self, nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix):
+    def on_val_end(self, nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix, results, called_from_train=False):
         # Callback runs on val end
         if self.wandb or self.clearml:
             files = sorted(self.save_dir.glob('val*.jpg'))
             if self.wandb:
                 self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
+                if not called_from_train:
+                    files = ['confusion_matrix.png', *(f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
+                    files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
+                    self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
+                    self.wandb.log(dict(zip(self.keys[3:7], results)))
+
+                    self.wandb.finish_run()
             if self.clearml:
                 self.clearml.log_debug_samples(files, title='Validation')
 

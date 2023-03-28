@@ -1,0 +1,6 @@
+names:
+  0: ball
+nc: 1
+test: wandb-artifact://firefly-ball-detector/test
+train: wandb-artifact://firefly-ball-detector/train
+val: wandb-artifact://firefly-ball-detector/val

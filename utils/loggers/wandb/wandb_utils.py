@@ -40,20 +40,34 @@ def check_wandb_config_file(data_config_file):
     return data_config_file
 
 
-def check_wandb_dataset(data_file):
+def check_wandb_dataset(data_file, test_data=None, all_data=False):
     is_trainset_wandb_artifact = False
     is_valset_wandb_artifact = False
+    is_testset_wandb_artifact = False
     if isinstance(data_file, dict):
         # In that case another dataset manager has already processed it and we don't have to
         return data_file
-    if check_file(data_file) and data_file.endswith('.yaml'):
+    if check_file(data_file):
         with open(data_file, errors='ignore') as f:
             data_dict = yaml.safe_load(f)
-        is_trainset_wandb_artifact = isinstance(data_dict['train'],
-                                                str) and data_dict['train'].startswith(WANDB_ARTIFACT_PREFIX)
-        is_valset_wandb_artifact = isinstance(data_dict['val'],
-                                              str) and data_dict['val'].startswith(WANDB_ARTIFACT_PREFIX)
-    if is_trainset_wandb_artifact or is_valset_wandb_artifact:
+
+        if all_data:
+            is_trainset_wandb_artifact = isinstance(data_dict['train'],
+                                                    str) and data_dict['train'].startswith(WANDB_ARTIFACT_PREFIX)
+            is_valset_wandb_artifact = isinstance(data_dict['val'],
+                                                  str) and data_dict['val'].startswith(WANDB_ARTIFACT_PREFIX)
+            is_testset_wandb_artifact = isinstance(data_dict['test'],
+                                                  str) and data_dict['test'].startswith(WANDB_ARTIFACT_PREFIX)
+        elif test_data:
+            is_testset_wandb_artifact = isinstance(data_dict[test_data], str) and data_dict[test_data].startswith(WANDB_ARTIFACT_PREFIX)
+            return data_dict if is_testset_wandb_artifact else False
+        else:
+            is_trainset_wandb_artifact = isinstance(data_dict['train'],
+                                                    str) and data_dict['train'].startswith(WANDB_ARTIFACT_PREFIX)
+            is_valset_wandb_artifact = isinstance(data_dict['val'],
+                                                  str) and data_dict['val'].startswith(WANDB_ARTIFACT_PREFIX)
+
+    if is_trainset_wandb_artifact or is_valset_wandb_artifact or is_testset_wandb_artifact:
         return data_dict
     else:
         return check_dataset(data_file)
@@ -132,10 +146,6 @@ class WandbLogger():
         job_type (str) -- To set the job_type for this run
 
        """
-        # Temporary-fix
-        if opt.upload_dataset:
-            opt.upload_dataset = False
-            # LOGGER.info("Uploading Dataset functionality is not being supported temporarily due to a bug.")
 
         # Pre-training routine --
         self.job_type = job_type
@@ -174,6 +184,11 @@ class WandbLogger():
                                         allow_val_change=True) if not wandb.run else wandb.run
         if self.wandb_run:
             if self.job_type == 'Training':
+                # Temporary-fix
+                if opt.upload_dataset:
+                    opt.upload_dataset = False
+                    # LOGGER.info("Uploading Dataset functionality is not being supported temporarily due to a bug.")
+
                 if opt.upload_dataset:
                     if not opt.resume:
                         self.wandb_artifact_data_dict = self.check_and_upload_dataset(opt)
@@ -193,12 +208,25 @@ class WandbLogger():
                     self.wandb_artifact_data_dict = self.wandb_artifact_data_dict or self.data_dict
 
                     # write data_dict to config. useful for resuming from artifacts. Do this only when not resuming.
-                    self.wandb_run.config.update({'data_dict': self.wandb_artifact_data_dict}, allow_val_change=True)
+                    # for key, val in self.wandb_artifact_data_dict.items():
+                    #     self.wandb_run.config.update({key: val}, allow_val_change=True)
                 self.setup_training(opt)
+
+            if self.job_type == "Testing":
+                self.data_dict = check_wandb_dataset(opt.data, opt.task)
+                if self.data_dict:
+                    self.setup_test(opt)
 
             if self.job_type == 'Dataset Creation':
                 self.wandb_run.config.update({"upload_dataset": True})
                 self.data_dict = self.check_and_upload_dataset(opt)
+
+            if self.job_type == 'Dataset Retrieval':
+                self.wandb_run.config.update({"download_dataset": True})
+                self.data_dict = check_wandb_dataset(opt.data, all_data=True)
+                if self.data_dict:
+                    self.setup_data(opt)
+
 
     def check_and_upload_dataset(self, opt):
         """
@@ -211,8 +239,7 @@ class WandbLogger():
         Updated dataset info dictionary where local dataset paths are replaced by WAND_ARFACT_PREFIX links.
         """
         assert wandb, 'Install wandb to upload dataset'
-        config_path = self.log_dataset_artifact(opt.data, opt.single_cls,
-                                                'YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem)
+        config_path = self.log_dataset_artifact(opt.data, opt.single_cls, opt.entity, 'YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem)
         with open(config_path, errors='ignore') as f:
             wandb_data_dict = yaml.safe_load(f)
         return wandb_data_dict
@@ -252,7 +279,7 @@ class WandbLogger():
             val_path = Path(self.val_artifact_path) / 'data/images/'
             data_dict['val'] = str(val_path)
 
-        if self.val_artifact is not None:
+        if self.val_artifact is not None and opt.upload_dataset:
             self.result_artifact = wandb.Artifact("run_" + wandb.run.id + "_progress", "evaluation")
             columns = ["epoch", "id", "ground truth", "prediction"]
             columns.extend(self.data_dict['names'])
@@ -268,6 +295,50 @@ class WandbLogger():
         # Update the the data_dict to point to local artifacts dir
         if train_from_artifact:
             self.data_dict = data_dict
+
+    def setup_test(self, opt):
+        """
+        Setup the necessary processes for testing YOLO models:
+          - Attempt to download model dataset artifacts
+          - Update data_dict
+          - Setup log_dict, initialize bbox_interval
+
+        arguments:
+        opt (namespace) -- commandline arguments for this run
+
+        """
+        data_dict = self.data_dict
+
+        test_artifact_path, test_artifact = self.download_dataset_artifact(
+            data_dict.get(opt.task), opt.artifact_alias)
+
+        test_path = Path(test_artifact_path) / 'data/images/'
+        data_dict[opt.task] = str(test_path)
+
+        test_from_artifact = test_artifact_path is not None
+        # Update the data_dict to point to local artifacts dir
+        if test_from_artifact:
+            self.data_dict = data_dict
+
+    def setup_data(self, opt):
+        data_dict = self.data_dict
+
+        train_artifact_path, train_artifact = self.download_dataset_artifact(
+            data_dict.get('train'), opt.artifact_alias)
+        val_artifact_path, val_artifact = self.download_dataset_artifact(
+            data_dict.get('val'), opt.artifact_alias)
+        test_artifact_path, test_artifact = self.download_dataset_artifact(
+            data_dict.get('test'), opt.artifact_alias)
+
+        train_path = Path(train_artifact_path) / 'data/images/'
+        data_dict['train'] = str(train_path)
+        val_path = Path(val_artifact_path) / 'data/images/'
+        data_dict['val'] = str(val_path)
+        test_path = Path(test_artifact_path) / 'data/images/'
+        data_dict['test'] = str(test_path)
+
+        self.data_dict = data_dict
+
 
     def download_dataset_artifact(self, path, alias):
         """
@@ -332,7 +403,7 @@ class WandbLogger():
                            aliases=['latest', 'last', 'epoch ' + str(self.current_epoch), 'best' if best_model else ''])
         LOGGER.info(f"Saving model artifact on epoch {epoch + 1}")
 
-    def log_dataset_artifact(self, data_file, single_cls, project, overwrite_config=False):
+    def log_dataset_artifact(self, data_file, single_cls, entity, project, overwrite_config=False):
         """
         Log the dataset as W&B artifact and return the new data file with W&B links
 
@@ -351,24 +422,34 @@ class WandbLogger():
         self.data_dict = check_dataset(data_file)  # parse and check
         data = dict(self.data_dict)
         nc, names = (1, ['item']) if single_cls else (int(data['nc']), data['names'])
-        names = {k: v for k, v in enumerate(names)}  # to index dictionary
+        # names = {k: v for k, v in enumerate(names)}  # to index dictionary
+
+        self.wandb_run.config.update({"nc": nc})
+        self.wandb_run.config.update({"names": names})
 
         # log train set
         if not log_val_only:
-            self.train_artifact = self.create_dataset_table(LoadImagesAndLabels(data['train'], rect=True, batch_size=1),
+            self.train_artifact = self.create_dataset_table(LoadImagesAndLabels(data['train'], rect=False, batch_size=1),
                                                             names,
                                                             name='train') if data.get('train') else None
             if data.get('train'):
-                data['train'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'train')
+                data['train'] = WANDB_ARTIFACT_PREFIX + str(Path(entity) / Path(project) / 'train')
 
         self.val_artifact = self.create_dataset_table(
-            LoadImagesAndLabels(data['val'], rect=True, batch_size=1), names, name='val') if data.get('val') else None
+            LoadImagesAndLabels(data['val'], rect=False, batch_size=1), names, name='val') if data.get('val') else None
         if data.get('val'):
-            data['val'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'val')
+            data['val'] = WANDB_ARTIFACT_PREFIX + str(Path(entity) / Path(project) / 'val')
 
         path = Path(data_file)
         # create a _wandb.yaml file with artifacts links if both train and test set are logged
         if not log_val_only:
+            if 'test' in data.keys():
+                test_artifact = self.create_dataset_table(LoadImagesAndLabels(data['test'],
+                                                                              rect=False, batch_size=1), names,
+                                                          name='test') if data.get('test') else None
+            if data.get('test'):
+                data['test'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'test')
+
             path = (path.stem if overwrite_config else path.stem + '_wandb') + '.yaml'  # updated data.yaml path
             path = ROOT / 'data' / path
             data.pop('download', None)
@@ -388,6 +469,8 @@ class WandbLogger():
         else:
             self.wandb_run.log_artifact(self.train_artifact)
             self.wandb_run.log_artifact(self.val_artifact)
+            if 'test' in data.keys():
+                self.wandb_run.log_artifact(test_artifact)
         return path
 
     def map_val_table_path(self):
